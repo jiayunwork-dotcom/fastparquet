@@ -549,15 +549,21 @@ def read_col(column, schema_helper, infile, use_cat=False,
         max_defi = schema_helper.max_definition_level(cmd.path_in_schema)
         if isinstance(row_filter, np.ndarray):
             io = index_off + len(val)  # will be new index_off
-            if row_filter[index_off:index_off+len(val)].sum() == 0:
+            page_sel = row_filter[index_off:index_off +
+                                  (len(defi) if defi is not None else len(val))]
+            if page_sel.sum() == 0:
                 num += len(defi) if defi is not None else len(val)
+                index_off = io
                 continue
             if defi is not None:
-                val = val[row_filter[index_off:index_off+len(defi)][defi == max_defi]]
-                defi = defi[row_filter[index_off:index_off+len(defi)]]
+                # reduce both the definition levels and the (non-null only)
+                # values to the selected rows so their lengths stay consistent
+                sel_valid = page_sel[defi == max_defi]
+                val = val[sel_valid]
+                defi = defi[page_sel]
             else:
-                val = val[row_filter[index_off:index_off+len(val)]]
-            rep = rep[row_filter[index_off:index_off+len(defi)]] if rep is not None else rep
+                val = val[page_sel]
+            rep = rep[page_sel] if rep is not None else rep
             index_off = io
         if rep is not None and assign.dtype.kind != 'O':  # pragma: no cover
             # this should never get called
@@ -609,7 +615,11 @@ def read_col(column, schema_helper, infile, use_cat=False,
             part = assign[num:num+len(defi)]
             if isinstance(part.dtype, pd.core.arrays.masked.BaseMaskedDtype):
                 # TODO: could have read directly into array
-                part._mask[:] = defi != max_defi
+                # When row filtering is active, 'val' and 'defi' have already
+                # been reduced to the selected rows, so their lengths match
+                # the output slice and index it from position 0.
+                nulls = defi != max_defi
+                part._mask[:] = nulls
                 part = part._data
             elif part.dtype.kind != "O":
                 part[defi != max_defi] = my_nan

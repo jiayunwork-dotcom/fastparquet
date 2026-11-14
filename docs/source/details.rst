@@ -248,6 +248,101 @@ To get the first row-group only, one would go:
 You can also grab the first N rows of the first row-group with :func:`fastparquet.ParquetFile.head`,
 or select from among a data-set's row-groups using slice notation ``pf_subset = pf[2:8]``.
 
+Predicate expressions
+---------------------
+
+In addition to the legacy DNF ``filters`` argument, ``to_pandas``,
+``iter_row_groups`` and ``count`` accept a ``predicate`` keyword containing a
+nested expression tree. Unlike ``filters``, callers do not have to expand
+AND/OR/NOT logic themselves, and null handling has a dedicated entry point.
+
+A predicate is a (possibly nested) ``dict``:
+
+* a comparison leaf has the keys ``column``, ``op`` and ``value``::
+
+      {"column": "amount", "op": ">", "value": 0}
+
+  with operators ``==``, ``!=``, ``<``, ``<=``, ``>``, ``>=``, ``in`` and
+  ``not in``; the membership operators take a ``list`` value, e.g.
+  ``{"column": "amount", "op": "in", "value": [1, 2, 3]}``;
+* a null-test leaf has only ``column`` and ``op``, where ``op`` is
+  ``"is null"`` or ``"is not null"``;
+* logic nodes contain a single key: ``{"and": [child, ...]}``,
+  ``{"or": [child, ...]}`` with a non-empty list, or ``{"not": child}``.
+
+The expression is never mutated and can be reused any number of times.
+
+Three-valued logic
+~~~~~~~~~~~~~~~~~~
+
+Missing values are unified across ``None``, ``float('nan')`` and
+:data:`pandas.NA`. An ordinary comparison where either side is missing
+evaluates to *unknown* rather than true or false. ``AND``, ``OR`` and ``NOT``
+follow SQL three-valued logic (in particular ``NOT unknown`` is still
+*unknown*), and only rows for which the whole predicate evaluates to *true*
+are selected. ``is null`` / ``is not null`` always evaluate to a definite
+true or false.
+
+Membership follows SQL rules:
+
+* ``x in [a, b]`` is true when a non-missing element equals ``x``; if there is
+  no hit but ``x`` or a list element is missing, the result is unknown;
+  otherwise it is false;
+* ``x in []`` is always false, even when ``x`` is missing;
+* ``not in`` is the three-valued negation of the same judgment, so
+  ``NOT (x > 0)`` cannot select a missing ``x`` and
+  ``x not in [1, None]`` cannot select other non-missing numbers.
+
+The two read stages
+~~~~~~~~~~~~~~~~~~~
+
+The same compiled predicate drives two stages that are guaranteed to agree:
+
+1. **Metadata pruning.** Row groups are excluded only when their min/max and
+   null statistics (or an exact Hive partition value) prove the predicate can
+   never be true. Missing statistics, a missing ``null_count``, NaN in float
+   statistics, or anything insufficient to prove exclusion keeps the group;
+   unknown is never treated as false and then negated. Per-column statistics
+   are combined without assuming correlations between columns. A
+   metadata-only call (``count`` with ``row_filter=False``, or a
+   ``row_filter=False`` read where every group is excluded) decodes no data
+   pages.
+2. **Exact row filtering.** With ``row_filter=True`` the columns actually
+   referenced by the predicate are decoded (only those, and only for row
+   groups that survived pruning) and the predicate is evaluated row by row,
+   keeping only true rows.
+
+Supported types
+~~~~~~~~~~~~~~~
+
+Predicates work on nullable or non-nullable signed 64-bit integer columns,
+``float64``, ``bool`` and UTF-8 string columns, including Hive partition
+columns of the same kinds. Literals are Python scalars (or ``None`` /
+``nan`` / :data:`pandas.NA` as missing values): integer columns accept only
+non-bool signed 64-bit integers, float columns accept such integers or
+floats (positive and negative infinity included), bool columns accept only
+bools and string columns only strings. The same checks apply to every
+element of an ``in`` / ``not in`` list. Other column types and incompatible
+literals raise ``ValueError``. Integers are compared in their decoded type
+and are never converted through float, so values beyond ``2**53`` keep their
+precision; strings compare by Unicode code-point order.
+
+Hive partition columns and columns stored in the data files can be mixed in
+one expression, including within a single ``or`` or ``not``. A column used by
+the predicate does not need to appear in ``columns`` and never leaks into the
+output.
+
+Compatibility
+~~~~~~~~~~~~~
+
+``predicate=None`` (the default) preserves the previous behaviour exactly.
+Passing a non-empty ``filters`` together with ``predicate``, or combining
+``predicate`` with a boolean-array ``row_filter``, raises ``ValueError``.
+Malformed expressions (unknown columns or operators, extra keys, wrong
+shapes, cyclic references, incompatible values) raise ``ValueError`` with a
+message locating the offending column or expression position, before any data
+page is read.
+
 Dask/Pandas
 -----------
 

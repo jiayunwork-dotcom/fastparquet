@@ -10,6 +10,7 @@ import pandas as pd
 
 from fastparquet import core, schema, converted_types, encoding, dataframe, writer
 from fastparquet import parquet_thrift
+from fastparquet import predicate as _predicate
 from fastparquet.cencoding import ThriftObject, from_buffer
 from fastparquet.json import json_decoder
 from fastparquet.util import (default_open, default_remove, ParquetException, val_to_num,
@@ -403,18 +404,39 @@ class ParquetFile(object):
         if ret:
             return df
 
-    def iter_row_groups(self, filters=None, **kwargs):
+    def iter_row_groups(self, filters=None, predicate=None, **kwargs):
         """
         Iterate a dataset by row-groups
 
-        If filters is given, omits row-groups that fail the filer
-        (saving execution time)
+        If filters or predicate is given, omits row-groups that cannot match
+        (saving execution time). With ``predicate`` and ``row_filter=True``,
+        row groups whose exact filtering leaves no rows are not yielded.
+
+        Parameters
+        ----------
+        filters: list of list of tuples
+            Legacy DNF filters; mutually exclusive with ``predicate``.
+        predicate: dict or None
+            Nested predicate expression (see
+            :meth:`ParquetFile.to_pandas`). Row groups are returned in the
+            order they appear in the dataset.
 
         Returns
         -------
-        Generator yielding one Pandas data-frame per row-group.
+        Generator yielding one Pandas data-frame per (non-empty) row-group.
         """
+        if predicate is not None:
+            # validate eagerly, before any data page is read
+            self._check_predicate_args(
+                predicate, filters, kwargs.get("row_filter", False))
+            compiled = self._compile_predicate(predicate)
+            row_filter = kwargs.pop("row_filter", False)
+            return self._iter_predicate_row_groups(compiled, row_filter,
+                                                    kwargs)
         rgs = filter_row_groups(self, filters) if filters else self.row_groups
+        return self._iter_legacy_row_groups(rgs, filters, kwargs)
+
+    def _iter_legacy_row_groups(self, rgs, filters, kwargs):
         for rg in rgs:
             i = self.row_groups.index(rg)
             df = self[i].to_pandas(filters=filters, **kwargs)
@@ -698,7 +720,7 @@ scheme is 'simple'.")
         return out
 
     def to_pandas(self, columns=None, categories=None, filters=[],
-                  index=None, row_filter=False, dtypes=None):
+                  index=None, row_filter=False, dtypes=None, predicate=None):
         """
         Read data from parquet into a Pandas dataframe.
 
@@ -738,11 +760,36 @@ scheme is 'simple'.")
             If boolean array, it is applied as custom row filter. In this case,
             'filter' parameter is ignored, and length of the array has to be
             equal to the total number of rows.
+            A boolean array cannot be combined with ``predicate``.
+        predicate: dict or None
+            Nested predicate expression evaluated with SQL three-valued logic
+            (true/false/unknown; see :mod:`fastparquet.predicate`). Comparison
+            leaves look like ``{"column": "amount", "op": ">", "value": 0}``
+            with operators ``==``, ``!=``, ``<``, ``<=``, ``>``, ``>=``,
+            ``in`` and ``not in``; null tests are
+            ``{"column": "x", "op": "is null"}`` / ``"is not null"``. Logic
+            nodes use a single key ``"and"`` / ``"or"`` (non-empty list of
+            sub-expressions) or ``"not"`` (one sub-expression). Missing values
+            (None, NaN, pandas.NA) make ordinary comparisons *unknown*, and
+            only rows where the whole expression is *true* are selected.
+            Columns referenced by the predicate need not appear in ``columns``
+            and never leak into the output; Hive partition columns and file
+            columns may be mixed, including within one OR/NOT. With
+            ``row_filter=False`` (default) row groups are pruned on metadata
+            statistics and whole surviving groups are returned; with
+            ``row_filter=True`` exact row-wise filtering is performed.
+            ``predicate`` cannot be combined with non-empty ``filters`` or a
+            boolean-array ``row_filter``.
 
         Returns
         -------
         Pandas data-frame
         """
+        self._check_predicate_args(predicate, filters, row_filter)
+        if predicate is not None:
+            return self._to_pandas_predicate(
+                predicate, columns=columns, categories=categories,
+                index=index, row_filter=row_filter, dtypes=dtypes)
         rgs = filter_row_groups(self, filters) if filters else self.row_groups
         index = self._get_index(index)
         if columns is not None:
@@ -781,42 +828,8 @@ selection does not match number of rows in DataFrame.')
             df.attrs = json.loads(self.key_value_metadata["PANDAS_ATTRS"])
 
         # Build per-column accumulators for arrow string columns.
-        # Object-dtype columns whose parquet schema marks them as UTF-8 will
-        # use the fast Cython path that builds ArrowStringArray directly.
-        # Skip columns whose dtype was explicitly requested as object (via dtypes=)
-        # to honour the caller's preference and to handle schema-evolution cases.
-        arrow_string_columns = {}
-        if _HAVE_ARROW and _USE_ARROW_STRINGS:
-            _cats = categories or {}
-            # Resolve user-supplied dtype overrides only (not auto-inferred ones).
-            # Auto-inferred dtypes always show dtype('O') for UTF-8 columns, so
-            # including them would block the arrow path for all string columns.
-            _user_dtypes = {}
-            if self._user_dtypes and self._base_dtype:
-                _user_dtypes.update(self._base_dtype)
-            if dtypes is not None:
-                _user_dtypes.update(dtypes)
-            # Detect schema-evolution columns: absent from some row groups.
-            # For those, the existing object-array fallback is more reliable.
-            _schema_evo_cols = set()
-            if len(rgs) > 1:
-                for rg in rgs:
-                    rg_cols = {'.'.join(c.meta_data.path_in_schema)
-                               for c in rg.columns}
-                    for col in df.columns:
-                        if col not in rg_cols:
-                            _schema_evo_cols.add(col)
-            for col in df.columns:
-                if (df[col].dtype == np.dtype('O')
-                        and col not in _cats
-                        and col not in _schema_evo_cols
-                        and _user_dtypes.get(col) != np.dtype('O')):
-                    arrow_string_columns[col] = []
-            # Also check index columns that are object dtype
-            if hasattr(df.index, 'dtype') and df.index.dtype == np.dtype('O'):
-                idx_name = df.index.name
-                if idx_name and idx_name in columns and idx_name not in _schema_evo_cols:
-                    arrow_string_columns[idx_name] = []
+        arrow_string_columns = self._arrow_string_setup(
+            rgs, df, columns, categories, dtypes)
 
         start = 0
         if self.file_scheme == 'simple':
@@ -841,25 +854,213 @@ selection does not match number of rows in DataFrame.')
             start += thislen
 
         # Finalize arrow string columns: concatenate per-page arrays and assign.
-        if _HAVE_ARROW and _USE_ARROW_STRINGS:
-            for col, parts in arrow_string_columns.items():
-                if not parts:
-                    continue
-                final_arr = _pa.chunked_array(parts)
-                if len(final_arr) != len(df):
-                    # Schema evolution: column absent in some row groups.  The
-                    # pre-allocated object array already has None for the missing
-                    # rows; skip the arrow conversion so callers see partial data.
-                    continue
-                arrow_str = pd.arrays.ArrowStringArray(
-                    final_arr, dtype=pd.StringDtype("pyarrow", na_value=np.nan)
-                )
-                if col in df.columns:
-                    df[col] = pd.Series(arrow_str, index=df.index, name=col, copy=False)
-                elif col == df.index.name:
-                    df.index = pd.Index(arrow_str, name=col, copy=False)
+        self._arrow_string_finalize(df, arrow_string_columns)
 
         return df
+
+    # ------------------------------------------------------------------
+    # predicate support
+    # ------------------------------------------------------------------
+
+    def _check_predicate_args(self, predicate, filters, row_filter):
+        if predicate is None:
+            return
+        if filters:
+            raise ValueError(
+                "predicate cannot be combined with the legacy filters "
+                "argument; pass either one or the other")
+        if not isinstance(row_filter, bool):
+            raise ValueError(
+                "predicate cannot be combined with a boolean-array "
+                "row_filter; use row_filter=True/False")
+
+    def _predicate_column_types(self):
+        """Lazy mapping of predicate-referenced columns to supported types."""
+        pf = self
+
+        class _ColumnTypes(dict):
+            def __missing__(self, column):
+                if column in pf.cats:
+                    value = _predicate.partition_column_type(pf.cats[column])
+                else:
+                    se = pf.schema.schema_element(column)
+                    value = _predicate.file_column_type(se)
+                self[column] = value
+                return value
+
+        return _ColumnTypes()
+
+    def _compile_predicate(self, predicate):
+        if isinstance(predicate, _predicate.CompiledPredicate):
+            return predicate
+        return _predicate.compile_predicate(
+            predicate, self._predicate_column_types())
+
+    def _partition_values(self, rg, partition_columns):
+        return {c: _predicate.partition_value_for_row_group(self, rg, c)
+                for c in partition_columns}
+
+    def _predicate_row_groups(self, compiled):
+        """Metadata pruning: row groups whose predicate cannot be true drop.
+
+        Returns ``(row_group, index, partition_values)`` tuples in dataset
+        order. Indices are positional, so they stay valid even though thrift
+        row-group objects compare by value (and can look identical).
+        """
+        partition_columns = list(self.cats)
+        kept = []
+        for i, rg in enumerate(self.row_groups):
+            if rg.num_rows == 0:
+                continue
+            pvalues = self._partition_values(rg, partition_columns)
+            stats = _predicate.RowGroupStats(self, rg)
+            if _predicate.row_group_may_match(compiled, stats, pvalues):
+                kept.append((rg, i, pvalues))
+        return kept
+
+    def _predicate_row_mask(self, rg, rg_index, compiled, partition_values):
+        """Exact evaluation: read only the referenced file columns."""
+        file_cols = compiled.file_columns(list(self.cats))
+        if file_cols:
+            col_df = self[rg_index].to_pandas(
+                columns=file_cols, index=False, predicate=None)
+            column_values = {c: col_df[c] for c in file_cols}
+        else:
+            column_values = {}
+        return compiled.row_mask(rg.num_rows, column_values, partition_values)
+
+    def _iter_predicate_row_groups(self, compiled, row_filter, kwargs):
+        for rg, i, pvalues in self._predicate_row_groups(compiled):
+            if row_filter:
+                mask = self._predicate_row_mask(rg, i, compiled, pvalues)
+                if not mask.any():
+                    continue
+                df = self[i].to_pandas(predicate=compiled, row_filter=True,
+                                       **kwargs)
+            else:
+                df = self[i].to_pandas(predicate=compiled, row_filter=False,
+                                       **kwargs)
+            if not df.empty:
+                yield df
+
+    def _to_pandas_predicate(self, predicate, columns, categories, index,
+                             row_filter, dtypes):
+        compiled = self._compile_predicate(predicate)
+        index = self._get_index(index)
+        if columns is not None:
+            columns = columns[:]
+        else:
+            columns = self.columns + list(self.cats)
+        if index:
+            columns += [i for i in index if i not in columns]
+        check_column_names(self.columns + list(self.cats), columns, categories)
+
+        candidates = self._predicate_row_groups(compiled)
+        if row_filter:
+            planned = []
+            total = 0
+            for rg, i, pvalues in candidates:
+                mask = self._predicate_row_mask(rg, i, compiled, pvalues)
+                total += int(mask.sum())
+                planned.append((rg, pvalues, mask))
+            size = total
+        else:
+            planned = [(rg, pvalues, None) for rg, _, pvalues in candidates]
+            size = sum(rg.num_rows for rg, _, _ in candidates)
+
+        rgs = [rg for rg, _, _ in planned]
+        df, views = self.pre_allocate(size, columns, categories, index,
+                                      dtypes=dtypes)
+        if "PANDAS_ATTRS" in self.key_value_metadata:
+            import json
+            df.attrs = json.loads(self.key_value_metadata["PANDAS_ATTRS"])
+        arrow_string_columns = self._arrow_string_setup(
+            rgs, df, columns, categories, dtypes)
+
+        start = 0
+        if self.file_scheme == 'simple':
+            infile = self.open(self.fn, 'rb')
+        else:
+            infile = None
+        for rg, pvalues, mask in planned:
+            if mask is None:
+                thislen = rg.num_rows
+                sel = None
+            else:
+                thislen = int(mask.sum())
+                if thislen == 0:
+                    continue
+                sel = np.asarray(mask, dtype=bool)
+            parts = {name: (v if name.endswith('-catdef')
+                            else v[start:start + thislen])
+                     for (name, v) in views.items()}
+            self.read_row_group_file(rg, columns, categories, index,
+                                     assign=parts, partition_meta=self.partition_meta,
+                                     row_filter=sel, infile=infile,
+                                     arrow_string_columns=arrow_string_columns)
+            start += thislen
+
+        self._arrow_string_finalize(df, arrow_string_columns)
+        return df
+
+    def _arrow_string_setup(self, rgs, df, columns, categories, dtypes):
+        """Build per-column accumulators for the arrow string read path."""
+        arrow_string_columns = {}
+        if not (_HAVE_ARROW and _USE_ARROW_STRINGS):
+            return arrow_string_columns
+        _cats = categories or {}
+        # Resolve user-supplied dtype overrides only (not auto-inferred ones).
+        # Auto-inferred dtypes always show dtype('O') for UTF-8 columns, so
+        # including them would block the arrow path for all string columns.
+        _user_dtypes = {}
+        if self._user_dtypes and self._base_dtype:
+            _user_dtypes.update(self._base_dtype)
+        if dtypes is not None:
+            _user_dtypes.update(dtypes)
+        # Detect schema-evolution columns: absent from some row groups.
+        # For those, the existing object-array fallback is more reliable.
+        _schema_evo_cols = set()
+        if len(rgs) > 1:
+            for rg in rgs:
+                rg_cols = {'.'.join(c.meta_data.path_in_schema)
+                           for c in rg.columns}
+                for col in df.columns:
+                    if col not in rg_cols:
+                        _schema_evo_cols.add(col)
+        for col in df.columns:
+            if (df[col].dtype == np.dtype('O')
+                    and col not in _cats
+                    and col not in _schema_evo_cols
+                    and _user_dtypes.get(col) != np.dtype('O')):
+                arrow_string_columns[col] = []
+        # Also check index columns that are object dtype
+        if hasattr(df.index, 'dtype') and df.index.dtype == np.dtype('O'):
+            idx_name = df.index.name
+            if idx_name and idx_name in columns and idx_name not in _schema_evo_cols:
+                arrow_string_columns[idx_name] = []
+        return arrow_string_columns
+
+    def _arrow_string_finalize(self, df, arrow_string_columns):
+        """Concatenate per-page arrow chunks back onto the output frame."""
+        if not (_HAVE_ARROW and _USE_ARROW_STRINGS):
+            return
+        for col, parts in arrow_string_columns.items():
+            if not parts:
+                continue
+            final_arr = _pa.chunked_array(parts)
+            if len(final_arr) != len(df):
+                # Schema evolution: column absent in some row groups.  The
+                # pre-allocated object array already has None for the missing
+                # rows; skip the arrow conversion so callers see partial data.
+                continue
+            arrow_str = pd.arrays.ArrowStringArray(
+                final_arr, dtype=pd.StringDtype("pyarrow", na_value=np.nan)
+            )
+            if col in df.columns:
+                df[col] = pd.Series(arrow_str, index=df.index, name=col,
+                                    copy=False)
+            elif col == df.index.name:
+                df.index = pd.Index(arrow_str, name=col, copy=False)
 
     def pre_allocate(self, size, columns, categories, index, dtypes=None):
         if dtypes is not None:
@@ -906,12 +1107,29 @@ selection does not match number of rows in DataFrame.')
                     df.columns.names = names
         return df, arrs
 
-    def count(self, filters=None, row_filter=False):
+    def count(self, filters=None, row_filter=False, predicate=None):
         """ Total number of rows
 
-        filters and row_filters have the same meaning as in to_pandas. Unless both are given,
-        this method will not need to decode any data
+        filters, predicate and row_filter have the same meaning as in
+        to_pandas. Unless exact row filtering (``row_filter=True``) is asked
+        for, this method will not need to decode any data page: metadata
+        pruning alone decides which row groups contribute, and whole groups
+        are counted. With ``row_filter=True`` the exact predicate is applied
+        and only rows evaluating to true are counted.
         """
+        self._check_predicate_args(predicate, filters, row_filter)
+        if predicate is not None:
+            compiled = self._compile_predicate(predicate)
+            candidates = self._predicate_row_groups(compiled)
+            if not row_filter:
+                # metadata only: no data page is decoded
+                return sum(rg.num_rows for rg, _, _ in candidates)
+            total = 0
+            for rg, i, pvalues in candidates:
+                mask = self._predicate_row_mask(rg, i, compiled, pvalues)
+                total += int(mask.sum())
+            return total
+
         if row_filter:
             cs = self._columns_from_filters(filters)
             df = self.to_pandas(columns=cs, filters=filters, row_filter=False,

@@ -4,6 +4,17 @@ Release Notes
 Releases since 2023 are essentially bugfixes only and updating
 supported python versions.
 
+Unreleased
+----------
+
+#. New ``predicate`` keyword on ``ParquetFile.to_pandas``,
+   ``iter_row_groups`` and ``count``: nested AND/OR/NOT expressions with
+   dedicated null tests and SQL three-valued logic. The same compiled tree
+   drives metadata-only row-group pruning and exact row filtering; legacy
+   ``filters`` behaviour is unchanged when ``predicate=None``.
+#. Correct row filtering into masked (nullable) integer/bool arrays when a
+   definition-level page is combined with a boolean row filter.
+
 2023.10.0
 ---------
 
