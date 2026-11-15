@@ -24,6 +24,13 @@ API
 
 .. autofunction:: update_file_custom_metadata
 
+Exact DECIMAL values
+--------------------
+
+See :ref:`exact-decimals` in :doc:`details` for the opt-in exact decimal
+write (``write(..., decimal_columns={col: (precision, scale)})``) and read
+(``ParquetFile(..., decimal_mode='decimal')``) support.
+
 
 .. raw:: html
 

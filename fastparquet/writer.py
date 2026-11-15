@@ -12,6 +12,7 @@ from pandas.core.arrays.masked import BaseMaskedDtype
 from fastparquet.util import join_path
 
 from fastparquet import parquet_thrift, __version__, cencoding
+from fastparquet import decimal_util
 from fastparquet.api import ParquetFile, partitions, part_ids
 from fastparquet.compression import compress_data
 from fastparquet.converted_types import tobson
@@ -392,6 +393,8 @@ def time_shift(indata, outdata, factor=1000):
 
 def encode_plain(data, se):
     """PLAIN encoding; returns byte representation"""
+    if decimal_util.is_exact_explicit(se):
+        return decimal_util.encode_plain_exact(data, se, data.name)
     out = convert(data, se)
     if se.type == parquet_thrift.Type.BYTE_ARRAY:
         return pack_byte_array(list(out))
@@ -494,8 +497,178 @@ def _rows_per_page(data, selement, has_nulls=True, page_size=None):
     return int(page_size // (bytes_per_element + 0.125 * has_nulls))
 
 
+def _write_decimal_column(f, data0, selement, compression=None,
+                          datapage_version=1, stats=True):
+    """Write one column with an exact DECIMAL physical representation.
+
+    ``selement`` must carry the exact-decimal marker (see
+    :func:`fastparquet.decimal_util.make_schema_element`).  Its physical type
+    determines the on-disk representation; values are validated and encoded
+    with decimal-context-free integer arithmetic only.
+    """
+    name = data0.name
+    info = decimal_util.schema_decimal_info(selement, name)
+    if info is None:  # pragma: no cover - guarded by the marker
+        raise ValueError("Column %r is not a DECIMAL column" % (name,))
+    precision, scale = info
+    physical = selement.type
+    type_length = selement.type_length
+
+    encoded, unscaled, null_mask = decimal_util.prepare_series(
+        data0, precision, scale, name, physical, type_length)
+    has_nulls = (selement.repetition_type
+                 == parquet_thrift.FieldRepetitionType.OPTIONAL)
+    if not has_nulls and null_mask.any():
+        row = int(np.flatnonzero(null_mask)[0])
+        raise ValueError(
+            "Column %r: value at row %d is missing but the column is "
+            "not allowed to contain nulls" % (name, row))
+
+    series = pd.Series(encoded, name=name)
+    tot_rows = len(series)
+    column_chunk_start = f.tell()
+    diff = 0
+
+    if physical == parquet_thrift.Type.INT32:
+        bytes_per_element = 4
+    elif physical == parquet_thrift.Type.INT64:
+        bytes_per_element = 8
+    elif physical == parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY:
+        bytes_per_element = max(int(type_length or 1), 1)
+    else:
+        lengths = [len(v) for v in encoded if v is not None]
+        bytes_per_element = (sum(lengths) / len(lengths) + 4) if lengths else 8
+    rows_per_page = max(int(MAX_PAGE_SIZE
+                            // (bytes_per_element + 0.125 * has_nulls)), 1)
+    row_offsets = list(range(0, tot_rows, rows_per_page)) + [tot_rows]
+
+    global_num_nulls = int(null_mask.sum())
+    if stats and global_num_nulls < tot_rows:
+        min_unscaled = max_unscaled = None
+        for value in unscaled:
+            if value is None:
+                continue
+            if min_unscaled is None or value < min_unscaled:
+                min_unscaled = value
+            if max_unscaled is None or value > max_unscaled:
+                max_unscaled = value
+        min_bytes, max_bytes = decimal_util.exact_stats_bytes(
+            min_unscaled, max_unscaled, selement)
+    else:
+        stats = False
+        min_bytes = max_bytes = None
+
+    for row_start, row_end in zip(row_offsets[:-1], row_offsets[1:]):
+        data = series.iloc[row_start:row_end]
+        if has_nulls:
+            num_nulls = int(null_mask[row_start:row_end].sum())
+            definition_data, data = make_definitions(
+                data, num_nulls == 0, datapage_version=datapage_version)
+        else:
+            definition_data = b""
+            num_nulls = 0
+        repetition_data = b""
+
+        if datapage_version == 1:
+            bdata = b"".join([
+                repetition_data, definition_data,
+                decimal_util.encode_plain_exact(list(data), selement, name),
+            ])
+            dph = parquet_thrift.DataPageHeader(
+                num_values=check_32(row_end - row_start),
+                encoding=parquet_thrift.Encoding.PLAIN,
+                definition_level_encoding=parquet_thrift.Encoding.RLE,
+                repetition_level_encoding=parquet_thrift.Encoding.BIT_PACKED,
+                i32=1,
+            )
+            l0 = len(bdata)
+            if compression:
+                bdata = compress_data(bdata, compression)
+                l1 = len(bdata)
+            else:
+                l1 = l0
+            diff += l0 - l1
+            ph = parquet_thrift.PageHeader(
+                type=parquet_thrift.PageType.DATA_PAGE,
+                uncompressed_page_size=check_32(l0),
+                compressed_page_size=check_32(l1),
+                data_page_header=dph, i32=1)
+            write_thrift(f, ph)
+            f.write(bdata)
+        elif datapage_version == 2:
+            is_compressed = isinstance(compression, dict) or (
+                compression is not None
+                and compression.upper() != "UNCOMPRESSED")
+            dph = parquet_thrift.DataPageHeaderV2(
+                num_values=check_32(row_end - row_start),
+                num_nulls=check_32(num_nulls),
+                num_rows=check_32(row_end - row_start),
+                encoding=parquet_thrift.Encoding.PLAIN,
+                definition_levels_byte_length=len(definition_data),
+                repetition_levels_byte_length=0,
+                is_compressed=is_compressed,
+                statistics=None,
+                i32=1,
+            )
+            bdata = decimal_util.encode_plain_exact(list(data), selement, name)
+            lb = len(bdata)
+            if is_compressed:
+                bdata = compress_data(bdata, compression)
+                diff += lb - len(bdata)
+            ph = parquet_thrift.PageHeader(
+                type=parquet_thrift.PageType.DATA_PAGE_V2,
+                uncompressed_page_size=check_32(lb + len(definition_data)),
+                compressed_page_size=check_32(len(bdata) + len(definition_data)),
+                data_page_header_v2=dph, i32=1)
+            write_thrift(f, ph)
+            f.write(definition_data)
+            f.write(bdata)
+
+    compressed_size = f.tell() - column_chunk_start
+    uncompressed_size = compressed_size + diff
+
+    p = [parquet_thrift.PageEncodingStats(
+        page_type=parquet_thrift.PageType.DATA_PAGE,
+        encoding=parquet_thrift.Encoding.PLAIN,
+        count=len(row_offsets) - 1, i32=1)]
+    encodings = [parquet_thrift.Encoding.PLAIN]
+
+    if isinstance(compression, dict):
+        algorithm = compression.get("type", None)
+    else:
+        algorithm = compression
+
+    if stats:
+        s = parquet_thrift.Statistics(
+            max=max_bytes, min=min_bytes,
+            max_value=max_bytes, min_value=min_bytes,
+            null_count=global_num_nulls)
+    else:
+        s = parquet_thrift.Statistics(null_count=global_num_nulls)
+
+    cmd = ThriftObject.from_fields(
+        "ColumnMetaData",
+        type=physical, path_in_schema=[name],
+        encodings=encodings,
+        codec=(getattr(parquet_thrift.CompressionCodec, algorithm.upper())
+               if algorithm else 0),
+        num_values=tot_rows,
+        statistics=s,
+        data_page_offset=column_chunk_start,
+        dictionary_page_offset=None,
+        encoding_stats=p,
+        key_value_metadata=[],
+        total_uncompressed_size=uncompressed_size,
+        total_compressed_size=compressed_size,
+        i32list=[1, 4]
+    )
+    return parquet_thrift.ColumnChunk(file_offset=column_chunk_start,
+                                      meta_data=cmd,
+                                      file_path=None)
+
+
 def write_column(f, data0, selement, compression=None, datapage_version=None,
-                 stats=True):
+                 stats=True, exact_decimal=False):
     """
     Write a single column of data to an open Parquet file
 
@@ -524,6 +697,10 @@ def write_column(f, data0, selement, compression=None, datapage_version=None,
 
     """
     datapage_version = datapage_version or DATAPAGE_VERSION
+    if exact_decimal or decimal_util.is_exact_explicit(selement):
+        return _write_decimal_column(
+            f, data0, selement, compression=compression,
+            datapage_version=datapage_version, stats=stats)
     has_nulls = selement.repetition_type == parquet_thrift.FieldRepetitionType.OPTIONAL
     tot_rows = len(data0)
     encoding = "PLAIN"
@@ -772,7 +949,8 @@ class DataFrameSizeWarning(UserWarning):
     pass
 
 
-def make_row_group(f, data, schema, compression=None, stats=True):
+def make_row_group(f, data, schema, compression=None, stats=True,
+                   decimal_columns=None):
     """ Make a single row group of a Parquet file """
     rows = len(data)
     if rows == 0:
@@ -806,14 +984,17 @@ def make_row_group(f, data, schema, compression=None, stats=True):
                 coldata = data[name]
             else:
                 coldata = data[column.name]
+            exact_decimal = bool(decimal_columns) and column.name in decimal_columns
             if isinstance(stats, int):
                 st = stats
             elif stats == "auto":
-                st = coldata.dtype.kind in ["i", "u", "f", "M"]
+                st = (coldata.dtype.kind in ["i", "u", "f", "M"]
+                      or exact_decimal)
             else:
                 st = column.name in stats
             chunk = write_column(f, coldata, column,
-                                 compression=comp, stats=st)
+                                 compression=comp, stats=st,
+                                 exact_decimal=exact_decimal)
             cols.append(chunk)
     rg = ThriftObject.from_fields(
         "RowGroup", num_rows=rows, columns=cols,
@@ -822,13 +1003,13 @@ def make_row_group(f, data, schema, compression=None, stats=True):
 
 
 def make_part_file(f, data, schema, compression=None, fmd=None,
-                   stats=True):
+                   stats=True, decimal_columns=None):
     if len(data) == 0:
         return
     with f as f:
         f.write(MARKER)
         rg = make_row_group(f, data, schema, compression=compression,
-                            stats=stats)
+                            stats=stats, decimal_columns=decimal_columns)
         if fmd is None:
             fmd = parquet_thrift.FileMetaData(num_rows=rg.num_rows,
                                               schema=schema,
@@ -850,7 +1031,7 @@ def make_part_file(f, data, schema, compression=None, fmd=None,
 
 def make_metadata(data, has_nulls=True, ignore_columns=None, fixed_text=None,
                   object_encoding=None, times='int64', index_cols=None, partition_cols=None,
-                  cols_dtype="object"):
+                  cols_dtype="object", decimal_columns=None):
     if ignore_columns is None:
         ignore_columns = []
     if index_cols is None:
@@ -920,10 +1101,39 @@ def make_metadata(data, has_nulls=True, ignore_columns=None, fixed_text=None,
             continue
         oencoding = (object_encoding if isinstance(object_encoding, str)
                      else object_encoding.get(column, None))
-        pandas_metadata['columns'].append(
-            get_column_metadata(data[column], column, object_dtype=oencoding))
+        is_decimal_col = bool(decimal_columns) and column in decimal_columns
+        if is_decimal_col:
+            # The on-disk type is DECIMAL regardless of the input dtype.  Do
+            # not let (e.g.) an Int64 input dtype make the pandas metadata
+            # claim an integer column: the default reader would then skip the
+            # DECIMAL scaling.
+            pandas_metadata['columns'].append({
+                'name': str(column) if not isinstance(column, str) else column,
+                'field_name': str(column) if not isinstance(column, str) else column,
+                'pandas_type': 'decimal',
+                'numpy_type': 'object',
+                'metadata': None,
+            })
+        else:
+            pandas_metadata['columns'].append(
+                get_column_metadata(data[column], column, object_dtype=oencoding))
         fixed = None if fixed_text is None else fixed_text.get(column, None)
         is_index = (column in index_cols_orig) if index_cols_orig else None
+        if is_decimal_col:
+            precision, scale = decimal_columns[column]
+            col_has_nulls = has_nulls
+            if has_nulls is None:
+                col_has_nulls = True
+            elif has_nulls is not True and has_nulls is not False:
+                col_has_nulls = column in has_nulls
+            repetition_type = (
+                parquet_thrift.FieldRepetitionType.OPTIONAL if col_has_nulls
+                else parquet_thrift.FieldRepetitionType.REQUIRED)
+            se = decimal_util.make_schema_element(
+                column, precision, scale, repetition_type)
+            schema.append(se)
+            root[5] += 1
+            continue
         if isinstance(data[column].dtype, pd.CategoricalDtype):
             se, type = find_type(data[column].cat.categories, fixed_text=fixed,
                                  object_encoding=oencoding, is_index=is_index)
@@ -948,7 +1158,7 @@ def make_metadata(data, has_nulls=True, ignore_columns=None, fixed_text=None,
 
 def write_simple(fn, data, fmd, row_group_offsets=None, compression=None,
                  open_with=default_open, has_nulls=None, append=False,
-                 stats=True):
+                 stats=True, decimal_columns=None):
     """
     Write to one single file (for file_scheme='simple')
 
@@ -996,7 +1206,8 @@ def write_simple(fn, data, fmd, row_group_offsets=None, compression=None,
         rgs = fmd.row_groups
         for i, row_group in enumerate(data):
             rg = make_row_group(f, row_group, fmd.schema,
-                                compression=compression, stats=stats)
+                                compression=compression, stats=stats,
+                                decimal_columns=decimal_columns)
             if rg is not None:
                 rgs.append(rg)
 
@@ -1146,7 +1357,7 @@ def write(filename, data, row_group_offsets=None,
           mkdirs=None, has_nulls=True, write_index=None,
           partition_on=[], fixed_text=None, append=False,
           object_encoding='infer', times='int64',
-          custom_metadata=None, stats="auto"):
+          custom_metadata=None, stats="auto", decimal_columns=None):
     """Write pandas dataframe to filename with parquet format.
 
     Parameters
@@ -1267,7 +1478,23 @@ def write(filename, data, row_group_offsets=None,
         If True, do it for every column;
         If False, never do;
         And if a list of str, do it only for those specified columns.
-        "auto" (default) means True for any int/float or timestamp column
+        "auto" (default) means True for any int/float or timestamp column, and
+        for exact-decimal columns.
+    decimal_columns: {col: (precision, scale)} or None
+        Opt-in exact DECIMAL writing. Each named column (which must occur
+        exactly once in the DataFrame) is written as a standard Parquet
+        DECIMAL using the given precision (1..38) and scale (0..precision),
+        with both ``LogicalType.DECIMAL`` and the deprecated
+        ``converted_type`` annotation. The physical representation (INT32,
+        INT64 or FIXED_LEN_BYTE_ARRAY) is chosen to cover the whole declared
+        range. Values must be ``Decimal`` or non-boolean integers; floats,
+        strings, bools, non-finite Decimals and values that would need
+        rounding are rejected. ``None``/``pd.NA``/NaN are treated as missing.
+        All validation happens before the target is created or modified.
+        This takes precedence over ``object_encoding``. Supported with
+        ``file_scheme='simple'`` only; when appending to a simple file the
+        declarations must match the existing DECIMAL schema. When ``None``
+        (default), the previous behaviour is unchanged.
 
     Examples
     --------
@@ -1279,18 +1506,32 @@ def write(filename, data, row_group_offsets=None,
     if file_scheme not in ('simple', 'hive', 'drill'):
         raise ValueError( 'File scheme should be simple|hive|drill, not '
                          f'{file_scheme}.')
+    if isinstance(partition_on, str):
+        partition_on = [partition_on]
+
+    exact = decimal_util.validate_declaration(data, decimal_columns)
+    if exact:
+        # All exact-decimal errors which can be detected from the incoming
+        # DataFrame are raised here, before the target is created or touched.
+        _validate_exact_decimal_write(
+            data, exact, file_scheme=file_scheme, partition_on=partition_on,
+            has_nulls=has_nulls)
+
     fs, filename, open_with, mkdirs = get_fs(filename, open_with, mkdirs)
 
     if append == 'overwrite':
+        if exact:
+            raise ValueError(
+                "decimal_columns is not supported with append='overwrite'")
         overwrite(dirpath=filename, data=data,
                   row_group_offsets=row_group_offsets, compression=compression,
                   open_with=open_with, mkdirs=mkdirs, remove_with=None,
                   stats=stats)
         return
-    if isinstance(partition_on, str):
-        partition_on = [partition_on]
     if append:
-        pf = ParquetFile(filename, open_with=open_with)
+        # 'float' mode keeps the historical append path untouched; exact
+        # columns are validated separately through the schema.
+        pf = ParquetFile(filename, open_with=open_with, decimal_mode='float')
         if pf._get_index():
             # Format dataframe (manage row index).
             data = reset_row_idx(data)
@@ -1307,6 +1548,29 @@ def write(filename, data, row_group_offsets=None,
             if tuple(partition_on) != tuple(pf.cats):
                 raise ValueError('When appending, partitioning columns must '
                                  'match existing data')
+        if exact:
+            if pf.file_scheme != 'simple':
+                raise ValueError(
+                    "decimal_columns with append=True is only supported for "
+                    "an existing single ('simple') parquet file")
+            if isinstance(data, pd.DataFrame):
+                expected = sorted(pf.columns + list(pf.cats))
+                if sorted(data.columns) != expected:
+                    diff = set(data.columns) ^ set(expected)
+                    raise ValueError(
+                        f"Column names of new data are {sorted(data.columns)}. "
+                        f"But column names in existing file are {expected}. "
+                        f"{diff} are columns being either only in existing "
+                        'file or only in new data. This is not possible.')
+            exact = _check_append_decimal_schema(pf, exact)
+            if isinstance(data, pd.DataFrame):
+                _validate_append_nulls(data, exact)
+            _validate_exact_decimal_data(data, exact)
+            _append_exact_decimal(filename, data, pf, exact,
+                                  row_group_offsets=row_group_offsets,
+                                  compression=compression, open_with=open_with,
+                                  stats=stats)
+            return
         pf.write_row_groups(data, row_group_offsets, sort_key=None,
                             sort_pnames=False, compression=compression,
                             write_fmd=True, open_with=open_with,
@@ -1337,7 +1601,8 @@ def write(filename, data, row_group_offsets=None,
                             fixed_text=fixed_text,
                             object_encoding=object_encoding,
                             times=times, index_cols=index_cols,
-                            partition_cols=partition_on, cols_dtype=cols_dtype)
+                            partition_cols=partition_on, cols_dtype=cols_dtype,
+                            decimal_columns=exact or None)
         if custom_metadata:
             kvm = fmd.key_value_metadata or []
             kvm.extend(
@@ -1353,7 +1618,8 @@ def write(filename, data, row_group_offsets=None,
             write_simple(filename, data, fmd,
                          row_group_offsets=row_group_offsets,
                          compression=compression, open_with=open_with,
-                         has_nulls=None, append=False, stats=stats)
+                         has_nulls=None, append=False, stats=stats,
+                         decimal_columns=exact or None)
         else:
             # Case 'hive', 'drill'
             write_multi(filename, data, fmd,
@@ -1362,6 +1628,163 @@ def write(filename, data, row_group_offsets=None,
                         write_fmd=True, open_with=open_with,
                         mkdirs=mkdirs, partition_on=partition_on,
                         append=False, stats=stats)
+
+
+def _validate_exact_decimal_write(data, exact, file_scheme, partition_on,
+                                  has_nulls):
+    """Eagerly reject ``decimal_columns`` usages that cannot work."""
+    if file_scheme != 'simple':
+        raise ValueError(
+            "decimal_columns is only supported with file_scheme='simple', "
+            "not %r" % (file_scheme,))
+    if partition_on:
+        raise ValueError(
+            "decimal_columns cannot be combined with partition_on")
+    # Determine which columns will actually be present later, taking the row
+    # index handling into account.  Validation of values uses the DataFrame as
+    # passed in, which is the required contract.
+    for name in exact:
+        if has_nulls is not None and not isinstance(has_nulls, str) \
+                and has_nulls is not True and has_nulls is not False \
+                and name not in has_nulls:
+            # Column will be REQUIRED: missing values are an error.
+            column = data[name]
+            nulls = _missing_mask(column)
+            if nulls.any():
+                row = int(np.flatnonzero(nulls)[0])
+                raise ValueError(
+                    "Column %r: value at row %d is missing but the column is "
+                    "not allowed to contain nulls" % (name, row))
+        elif has_nulls is False:
+            column = data[name]
+            nulls = _missing_mask(column)
+            if nulls.any():
+                row = int(np.flatnonzero(nulls)[0])
+                raise ValueError(
+                    "Column %r: value at row %d is missing but the column is "
+                    "not allowed to contain nulls" % (name, row))
+    _validate_exact_decimal_data(data, exact)
+
+
+def _missing_mask(column):
+    """Boolean ndarray of missing values in a Series."""
+    values = column.to_numpy(dtype=object, copy=False) \
+        if hasattr(column, "to_numpy") else list(column)
+    return np.array([decimal_util.is_missing(v) for v in values], dtype=bool)
+
+
+def _validate_exact_decimal_data(data, exact):
+    """Validate every value of every exact-decimal column before writing."""
+    for name, info in exact.items():
+        precision, scale = info[0], info[1]
+        if name not in data.columns:
+            continue
+        decimal_util.validate_column_values(data[name], name, precision, scale)
+
+
+def _validate_append_nulls(data, exact):
+    """Reject missing values when an existing exact column is REQUIRED."""
+    for name, info in exact.items():
+        if len(info) < 5:
+            continue
+        repetition = info[4]
+        if repetition == parquet_thrift.FieldRepetitionType.OPTIONAL:
+            continue
+        if name not in data.columns:
+            continue
+        nulls = _missing_mask(data[name])
+        if nulls.any():
+            row = int(np.flatnonzero(nulls)[0])
+            raise ValueError(
+                "Column %r: value at row %d is missing but the existing "
+                "column is required" % (name, row))
+
+
+def _check_append_decimal_schema(pf, exact):
+    """Validate an append against the existing file's DECIMAL schema.
+
+    Returns a mapping ``{name: (precision, scale, physical, type_length)}``
+    covering every exact column, using the *existing* physical type so the
+    encoding matches the file.
+    """
+    out = {}
+    for name, (precision, scale) in exact.items():
+        se = pf.schema.root["children"].get(name)
+        if se is None:
+            raise ValueError(
+                "Column %r: cannot append with decimal_columns because the "
+                "existing file has no such DECIMAL column" % (name,))
+        info = decimal_util.schema_decimal_info(se, name)
+        if info is None:
+            raise ValueError(
+                "Column %r: cannot append with decimal_columns because the "
+                "existing column is not DECIMAL" % (name,))
+        if tuple(info) != (precision, scale):
+            raise ValueError(
+                "Column %r: declared precision/scale %s does not match the "
+                "existing file's DECIMAL schema %s"
+                % (name, (precision, scale), info))
+        out[name] = (precision, scale, se.type, se.type_length,
+                     se.repetition_type)
+    return out
+
+
+def _append_exact_decimal(filename, data, pf, exact, row_group_offsets=None,
+                          compression=None, open_with=default_open,
+                          stats=True):
+    """Append exactly-encoded DECIMAL row groups to a simple file."""
+    schema = pf.fmd.schema
+    # Use private copies carrying the exact marker; the file's own metadata
+    # objects must not be modified.
+    row_schema = []
+    for se in schema:
+        name = getattr(se, "name", None)
+        if se.num_children not in (None, 0) or name not in exact:
+            row_schema.append(se)
+            continue
+        precision, scale, physical, type_length, _repetition = exact[name]
+        copy_se = decimal_util.make_schema_element(
+            name, precision, scale, se.repetition_type)
+        # Preserve the original physical representation.
+        copy_se.type = physical
+        copy_se.type_length = type_length
+        row_schema.append(copy_se)
+    decimal_names = {}
+    for name, info in exact.items():
+        copy_se = decimal_util.find_schema_element(row_schema, name)
+        if copy_se is not None:
+            decimal_names[name] = (info[0], info[1])
+
+    if isinstance(data, pd.DataFrame):
+        data = iter_dataframe(data, row_group_offsets)
+
+    def write_to_file(f):
+        f.seek(-8, 2)
+        head_size = struct.unpack('<I', f.read(4))[0]
+        f.seek(-(head_size + 8), 2)
+        new_rgs = []
+        for row_group in data:
+            rg = make_row_group(f, row_group, row_schema,
+                                compression=compression, stats=stats,
+                                decimal_columns=decimal_names)
+            if rg is not None:
+                new_rgs.append(rg)
+        if not new_rgs:
+            # Nothing was written: only seeks happened, so the file is
+            # already untouched.
+            return
+        rgs = pf.fmd.row_groups + new_rgs
+        fmd = copy(pf.fmd)
+        fmd.row_groups = rgs
+        fmd.num_rows = sum(rg.num_rows for rg in rgs)
+        foot_size = write_thrift(f, fmd)
+        f.write(struct.pack(b"<I", foot_size))
+        f.write(MARKER)
+
+    mode = 'rb+'
+    of = open_with(filename, mode)
+    with of as f:
+        write_to_file(f)
 
 
 def find_max_part(row_groups):

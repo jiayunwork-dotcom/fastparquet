@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from fastparquet import parquet_thrift
+from fastparquet import decimal_util
 from fastparquet.cencoding import time_shift
 from fastparquet.json import json_decoder
 
@@ -100,10 +101,23 @@ def _logical_to_time_dtype(logical_timestamp_type):
     return np.dtype(f"<M8[{unit}]")
 
 
-def typemap(se, md=None):
+def is_decimal_schema(se):
+    """True if the schema element is DECIMAL via either annotation."""
+    if getattr(se, 'converted_type', None) == parquet_thrift.ConvertedType.DECIMAL:
+        return True
+    return decimal_util._logical_decimal(
+        getattr(se, 'logicalType', None)) is not None
+
+
+def typemap(se, md=None, decimal_mode='float'):
     """Get the final dtype - no actual conversion"""
     md = md or {}
     md = md.get(se.name, {})
+    if decimal_mode == 'decimal' and is_decimal_schema(se):
+        # Validate the annotation eagerly; malformed DECIMAL schemas must not
+        # silently fall through to the float path.
+        decimal_util.schema_decimal_info(se, se.name)
+        return np.dtype('O')
     if md and ("Int" in md["numpy_type"] or md["numpy_type"] == "boolean"):
         # arrow has numpy and pandas types swapped
         return pandas_nullable[md["numpy_type"]]
@@ -146,15 +160,7 @@ def converts_inplace(se):
     return False
 
 
-def convert(data, se, timestamp96=True, dtype=None):
-    """Convert known types from primitive to rich.
-
-    Parameters
-    ----------
-    data: pandas series of primitive type
-    se: a schema element.
-    timestamp96: convert int96 as if it were written by mr-parquet
-    """
+def convert(data, se, timestamp96=True, dtype=None, decimal_mode='float'):
     ctype = se.converted_type
     if se.type == parquet_thrift.Type.INT96 and timestamp96:
         data2 = data.view([('ns', 'i8'), ('day', 'i4')])
@@ -165,6 +171,12 @@ def convert(data, se, timestamp96=True, dtype=None):
         dt = _logical_to_time_dtype(se.logicalType.TIMESTAMP)
         return data.view(dt)
     if ctype is None:
+        if (decimal_mode == 'decimal'
+                and getattr(getattr(se, 'logicalType', None), 'DECIMAL', None)
+                is not None):
+            from fastparquet import decimal_util
+            info = decimal_util.schema_decimal_info(se, se.name)
+            return decimal_util.decode_values(data, se, info[1])
         return data
     if ctype == parquet_thrift.ConvertedType.UTF8:
         import pandas as pd
@@ -177,6 +189,12 @@ def convert(data, se, timestamp96=True, dtype=None):
             return pd.Series(data).str.decode("utf8").values
         # already converted in speedups.unpack_byte_array
         return data
+    if ctype == parquet_thrift.ConvertedType.DECIMAL and decimal_mode == 'decimal':
+        from fastparquet import decimal_util
+        info = decimal_util.schema_decimal_info(se, se.name)
+        if info is None:  # pragma: no cover - ctype says DECIMAL
+            raise ValueError("Column %r is not a DECIMAL" % (se.name,))
+        return decimal_util.decode_values(data, se, info[1])
     if ctype == parquet_thrift.ConvertedType.DECIMAL:
         scale_factor = 10**-se.scale
         if data.dtype.kind in ['i', 'f']:

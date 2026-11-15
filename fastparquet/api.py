@@ -9,6 +9,7 @@ import fsspec
 import pandas as pd
 
 from fastparquet import core, schema, converted_types, encoding, dataframe, writer
+from fastparquet import decimal_util
 from fastparquet import parquet_thrift
 from fastparquet import predicate as _predicate
 from fastparquet.cencoding import ThriftObject, from_buffer
@@ -65,6 +66,17 @@ class ParquetFile(object):
         unless pandas metadata indicates that the original datatypes were nullable.
         Pandas nullable types were introduces in v1.0.0, but were still marked as
         experimental in v1.3.0.
+    decimal_mode: 'float' or 'decimal'
+        How Parquet DECIMAL columns are returned. The default ``'float'``
+        preserves the historical behaviour (float64 columns, lossy for large
+        or high-scale values). ``'decimal'`` returns exact Python
+        :class:`decimal.Decimal` objects in object columns, at the file's
+        declared scale, with ``None`` for missing values. It supports the
+        INT32, INT64, BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY representations and
+        either or both annotation forms, and applies to ``to_pandas``,
+        ``iter_row_groups``, projections, row-group slicing, multi-file
+        datasets and ``statistics``. Nested/repeated DECIMAL columns are
+        rejected in this mode; other columns are unaffected.
 
     Attributes
     ----------
@@ -110,7 +122,13 @@ class ParquetFile(object):
     _user_dtypes = False  # whether _base_dtype was user-supplied
 
     def __init__(self, fn, verify=False, open_with=default_open, root=False,
-                 sep=None, fs=None, pandas_nulls=True, dtypes=None):
+                 sep=None, fs=None, pandas_nulls=True, dtypes=None,
+                 decimal_mode='float'):
+        if decimal_mode not in ('float', 'decimal'):
+            raise ValueError(
+                "decimal_mode must be 'float' or 'decimal', got %r"
+                % (decimal_mode,))
+        self.decimal_mode = decimal_mode
         self.pandas_nulls = pandas_nulls
         self._base_dtype = dtypes
         # Track whether _base_dtype was user-supplied (True) or auto-inferred (False).
@@ -290,6 +308,37 @@ class ParquetFile(object):
     def basepath(self):
         return re.sub(r'_metadata(/)?$', '', self.fn).rstrip('/')
 
+    def _check_nested_decimal(self, columns, row_groups=None):
+        """Reject exact reads of nested/repeated DECIMAL columns.
+
+        Only flat, non-repeated DECIMAL columns are supported in 'decimal'
+        mode.  A DECIMAL leaf that lives inside a group (LIST/MAP/struct) is
+        rejected if that top-level column is selected; other nested columns
+        keep their previous behaviour.
+        """
+        if getattr(self, 'decimal_mode', 'float') != 'decimal':
+            return
+        if columns is None:
+            selected = None
+        else:
+            selected = set(columns)
+        for rg in (row_groups if row_groups is not None else self.row_groups):
+            for chunk in rg.columns:
+                path = list(chunk.meta_data.path_in_schema)
+                if len(path) == 1:
+                    continue
+                try:
+                    se = self.schema.schema_element(path)
+                except KeyError:
+                    continue
+                if not converted_types.is_decimal_schema(se):
+                    continue
+                top = path[0]
+                if selected is None or top in selected:
+                    raise ValueError(
+                        "Column %r: exact decimal reading does not support "
+                        "nested or repeated DECIMAL columns" % (".".join(path),))
+
     def _read_partitions(self):
         # paths = [rg.columns[0].file_path] ... if rg.columns]
         paths = [rg[1][0].get(1, "") for rg in self.row_groups if rg[1]]
@@ -328,7 +377,8 @@ class ParquetFile(object):
         new_pf.__setstate__(
             {"fn": self.fn, "open": self.open, "fmd": fmd,
              "pandas_nulls": self.pandas_nulls, "_base_dtype": self._base_dtype,
-             "tz": self.tz, "_columns_dtype": self._columns_dtype}
+             "tz": self.tz, "_columns_dtype": self._columns_dtype,
+             "decimal_mode": getattr(self, 'decimal_mode', 'float')}
         )
         new_pf._set_attrs()
         return new_pf
@@ -400,6 +450,7 @@ class ParquetFile(object):
             selfmade=self.selfmade, index=index,
             assign=assign, scheme=self.file_scheme, partition_meta=partition_meta,
             row_filter=row_filter, arrow_string_columns=arrow_string_columns,
+            decimal_mode=getattr(self, 'decimal_mode', 'float'),
         )
         if ret:
             return df
@@ -522,7 +573,7 @@ class ParquetFile(object):
     def write_row_groups(self, data, row_group_offsets=None, sort_key=None,
                          sort_pnames:bool=False, compression=None,
                          write_fmd:bool=True, open_with=default_open,
-                         mkdirs=None, stats="auto"):
+                         mkdirs=None, stats="auto", decimal_columns=None):
         """Write data as new row groups to disk, with optional sorting.
 
         Parameters
@@ -586,7 +637,8 @@ class ParquetFile(object):
             write_simple(self.fn, data, self.fmd,
                          row_group_offsets=row_group_offsets,
                          compression=compression, open_with=open_with,
-                         has_nulls=None, append=True, stats=stats)
+                         has_nulls=None, append=True, stats=stats,
+                         decimal_columns=decimal_columns)
         else:
             # Case 'hive' or 'drill'.
             write_multi(self.basepath, data, self.fmd,
@@ -786,6 +838,9 @@ scheme is 'simple'.")
         Pandas data-frame
         """
         self._check_predicate_args(predicate, filters, row_filter)
+        if dtypes is not None:
+            # Reject incompatible explicit dtypes before any data page is read.
+            self._check_decimal_dtypes(dtypes)
         if predicate is not None:
             return self._to_pandas_predicate(
                 predicate, columns=columns, categories=categories,
@@ -799,6 +854,7 @@ scheme is 'simple'.")
         if index:
             columns += [i for i in index if i not in columns]
         check_column_names(self.columns + list(self.cats), columns, categories)
+        self._check_nested_decimal(columns, rgs)
         if row_filter is not False:
             if filters and row_filter is True:
                 # Rows are selected as per filters.
@@ -828,6 +884,7 @@ selection does not match number of rows in DataFrame.')
             df.attrs = json.loads(self.key_value_metadata["PANDAS_ATTRS"])
 
         # Build per-column accumulators for arrow string columns.
+        exact_decimal_columns = self._exact_decimal_columns(rgs, columns)
         arrow_string_columns = self._arrow_string_setup(
             rgs, df, columns, categories, dtypes)
 
@@ -855,6 +912,7 @@ selection does not match number of rows in DataFrame.')
 
         # Finalize arrow string columns: concatenate per-page arrays and assign.
         self._arrow_string_finalize(df, arrow_string_columns)
+        self._exact_decimal_finalize(df, exact_decimal_columns)
 
         return df
 
@@ -956,6 +1014,8 @@ selection does not match number of rows in DataFrame.')
         check_column_names(self.columns + list(self.cats), columns, categories)
 
         candidates = self._predicate_row_groups(compiled)
+        self._check_nested_decimal(
+            columns, [rg for rg, _, _ in candidates])
         if row_filter:
             planned = []
             total = 0
@@ -974,6 +1034,7 @@ selection does not match number of rows in DataFrame.')
         if "PANDAS_ATTRS" in self.key_value_metadata:
             import json
             df.attrs = json.loads(self.key_value_metadata["PANDAS_ATTRS"])
+        exact_decimal_columns = self._exact_decimal_columns(rgs, columns)
         arrow_string_columns = self._arrow_string_setup(
             rgs, df, columns, categories, dtypes)
 
@@ -1001,6 +1062,7 @@ selection does not match number of rows in DataFrame.')
             start += thislen
 
         self._arrow_string_finalize(df, arrow_string_columns)
+        self._exact_decimal_finalize(df, exact_decimal_columns)
         return df
 
     def _arrow_string_setup(self, rgs, df, columns, categories, dtypes):
@@ -1062,11 +1124,70 @@ selection does not match number of rows in DataFrame.')
             elif col == df.index.name:
                 df.index = pd.Index(arrow_str, name=col, copy=False)
 
+    def _check_decimal_dtypes(self, dtypes):
+        """Reject explicit non-object dtypes for DECIMAL columns.
+
+        This runs before any data page is read.  In 'decimal' mode DECIMAL
+        values must be stored in object columns holding ``Decimal`` objects.
+        """
+        if getattr(self, 'decimal_mode', 'float') != 'decimal':
+            return
+        for name, dtype in dict(dtypes).items():
+            try:
+                se = self.schema.schema_element(name)
+            except (KeyError, TypeError):
+                continue
+            if se.num_children not in (None, 0):
+                continue
+            if not converted_types.is_decimal_schema(se):
+                continue
+            try:
+                is_object = np.dtype(dtype) == np.dtype('O')
+            except TypeError:
+                is_object = str(dtype) == 'object'
+            if not is_object:
+                raise ValueError(
+                    "Column %r: decimal_mode='decimal' requires an object "
+                    "dtype for DECIMAL columns, got %r" % (name, dtype))
+
+    def _selected_decimal_columns(self, columns):
+        """Names of selected top-level DECIMAL columns (validated schema)."""
+        out = []
+        if getattr(self, 'decimal_mode', 'float') != 'decimal':
+            return out
+        for name in columns:
+            if name not in self.schema.root["children"]:
+                continue
+            se = self.schema.root["children"][name]
+            if se.num_children not in (None, 0):
+                continue
+            if converted_types.is_decimal_schema(se):
+                decimal_util.schema_decimal_info(se, name)
+                if se.repetition_type == parquet_thrift.FieldRepetitionType.REPEATED:
+                    raise ValueError(
+                        "Column %r: exact decimal reading does not support "
+                        "repeated DECIMAL columns" % (name,))
+                out.append(name)
+        return out
+
+    def _exact_decimal_columns(self, rgs, columns):
+        """Set of selected top-level DECIMAL columns to decode exactly."""
+        return set(self._selected_decimal_columns(columns))
+
+    def _exact_decimal_finalize(self, df, exact_decimal_columns):
+        """Ensure exactly-decoded DECIMAL columns are object dtype."""
+        if not exact_decimal_columns:
+            return
+        for name in exact_decimal_columns:
+            if name in df.columns and df[name].dtype != object:
+                df[name] = df[name].astype(object)
+
     def pre_allocate(self, size, columns, categories, index, dtypes=None):
         if dtypes is not None:
             columns = list(dtypes)
         else:
             dtypes = self._dtypes(categories)
+        self._check_decimal_dtypes(dtypes)
         categories = self.check_categories(categories)
         cats = {k: v for k, v in self.cats.items() if k in columns}
         df, arrs = _pre_allocate(size, columns, categories, index, cats,
@@ -1238,10 +1359,13 @@ selection does not match number of rows in DataFrame.')
                 md = None
             self.tz = tz
 
-            dtype = OrderedDict((name, (converted_types.typemap(f, md=md)
-                                if f.num_children in [None, 0] else np.dtype("O")))
-                                for name, f in self.schema.root["children"].items()
-                                if getattr(f, 'isflat', False) is False)
+            decimal_mode = getattr(self, 'decimal_mode', 'float')
+            dtype = OrderedDict(
+                (name,
+                 (converted_types.typemap(f, md=md, decimal_mode=decimal_mode)
+                  if f.num_children in [None, 0] else np.dtype("O")))
+                for name, f in self.schema.root["children"].items()
+                if getattr(f, 'isflat', False) is False)
             for i, (col, dt) in enumerate(dtype.copy().items()):
                 # int and bool columns produce masked pandas types, no need to
                 # promote types here
@@ -1297,7 +1421,7 @@ selection does not match number of rows in DataFrame.')
             self.fmd.row_groups = []
         return {"fn": self.fn, "open": self.open, "fmd": self.fmd,
                 "pandas_nulls": self.pandas_nulls, "_base_dtype": self._base_dtype,
-                "tz": self.tz}
+                "tz": self.tz, "decimal_mode": getattr(self, "decimal_mode", "float")}
 
     def __setstate__(self, state):
         self.__dict__.update(state)
@@ -1550,9 +1674,30 @@ def statistics(obj):
         if not L:
             return d
         schema = obj.schema
+        decimal_mode = getattr(obj, 'decimal_mode', 'float')
         for col in obj.row_groups[0].columns:
             column = '.'.join(col.meta_data.path_in_schema)
             se = schema.schema_element(col.meta_data.path_in_schema)
+            if decimal_mode == 'decimal' and converted_types.is_decimal_schema(se):
+                info = decimal_util.schema_decimal_info(se, column)
+                for name in ['min', 'max']:
+                    values = d[name].get(column)
+                    if values is None:
+                        continue
+                    converted = []
+                    ok = True
+                    for value in values:
+                        if value is None:
+                            converted.append(None)
+                            continue
+                        try:
+                            converted.append(decimal_util.decode_stat_value(
+                                value, se, info[1]))
+                        except (ValueError, TypeError):
+                            ok = False
+                            break
+                    d[name][column] = converted if ok else [None]
+                continue
             if (se.converted_type is not None or se.logicalType is not None
                     or se.type == parquet_thrift.Type.INT96):
                 dtype = 'S12' if se.type == parquet_thrift.Type.INT96 else None

@@ -107,7 +107,7 @@ def read_rep(io_obj, daph, helper, metadata, out=None):
 
 
 def read_data_page(f, helper, header, metadata, skip_nulls=False,
-                   selfmade=False):
+                   selfmade=False, decimal_mode='float'):
     """Read a data page: definitions, repetitions, values (in order)
 
     Only values are guaranteed to exist, e.g., for a top-level, required
@@ -204,7 +204,8 @@ def read_dictionary_page(file_obj, schema_helper, page_header, column_metadata, 
 
 def read_data_page_v2(infile, schema_helper, se, data_header2, cmd,
                       dic, assign, num, use_cat, file_offset, ph, idx=None,
-                      selfmade=False, row_filter=None, arrow_parts=None):
+                      selfmade=False, row_filter=None, arrow_parts=None,
+                      decimal_mode='float'):
     """
     :param infile: open file
     :param schema_helper:
@@ -288,13 +289,13 @@ def read_data_page_v2(infile, schema_helper, se, data_header2, cmd,
     ):
         # PLAIN read directly into output (a copy for remote files)
         assign[num:num+n_values].view('uint8')[:] = infile.read(size)
-        convert(assign[num:num+n_values], se)
+        convert(assign[num:num+n_values], se, decimal_mode=decimal_mode)
     elif into and data_header2.encoding == parquet_thrift.Encoding.PLAIN:
         # PLAIN decompress directly into output
         decomp = decom_into[rev_map[cmd.codec]]
         decomp(np.frombuffer(infile.read(size), dtype="uint8"),
                assign[num:num+data_header2.num_values].view('uint8'))
-        convert(assign[num:num+n_values], se)
+        convert(assign[num:num+n_values], se, decimal_mode=decimal_mode)
     elif data_header2.encoding == parquet_thrift.Encoding.PLAIN:
         # PLAIN, but with nulls or not in-place conversion
         codec = cmd.codec if data_header2.is_compressed else "UNCOMPRESSED"
@@ -320,15 +321,15 @@ def read_data_page_v2(infile, schema_helper, se, data_header2, cmd,
                                 utf=se.converted_type == 0)
             if data_header2.num_nulls:
                 if nullable:
-                    assign[num:num+data_header2.num_values][~nulls[row_filter]] = convert(values, se)[row_filter]
+                    assign[num:num+data_header2.num_values][~nulls[row_filter]] = convert(values, se, decimal_mode=decimal_mode)[row_filter]
                 else:
                     assign[num:num+data_header2.num_values][nulls[row_filter]] = None  # or nan or nat
                     if row_filter is Ellipsis:
-                        assign[num:num+data_header2.num_values][~nulls] = convert(values, se)
+                        assign[num:num+data_header2.num_values][~nulls] = convert(values, se, decimal_mode=decimal_mode)
                     else:
-                        assign[num:num+data_header2.num_values][~nulls[row_filter]] = convert(values, se)[row_filter[~nulls]]
+                        assign[num:num+data_header2.num_values][~nulls[row_filter]] = convert(values, se, decimal_mode=decimal_mode)[row_filter[~nulls]]
             else:
-                assign[num:num+data_header2.num_values] = convert(values, se)[row_filter]
+                assign[num:num+data_header2.num_values] = convert(values, se, decimal_mode=decimal_mode)[row_filter]
     elif (use_cat and data_header2.encoding in [
         parquet_thrift.Encoding.PLAIN_DICTIONARY,
         parquet_thrift.Encoding.RLE_DICTIONARY,
@@ -429,7 +430,7 @@ def read_data_page_v2(infile, schema_helper, se, data_header2, cmd,
             encoding.delta_binary_unpack(
                 encoding.NumpyIO(raw_bytes), encoding.NumpyIO(out.view('uint8'))
             )
-            assign[num:num+data_header2.num_values][row_filter] = convert(out, se)[row_filter]
+            assign[num:num+data_header2.num_values][row_filter] = convert(out, se, decimal_mode=decimal_mode)[row_filter]
     else:
         # codec = cmd.codec if data_header2.is_compressed else "UNCOMPRESSED"
         # raw_bytes = decompress_data(infile.read(size),
@@ -440,7 +441,7 @@ def read_data_page_v2(infile, schema_helper, se, data_header2, cmd,
 
 def read_col(column, schema_helper, infile, use_cat=False,
              selfmade=False, assign=None, catdef=None,
-             row_filter=None, arrow_parts=None):
+             row_filter=None, arrow_parts=None, decimal_mode='float'):
     """Using the given metadata, read one column in one row-group.
 
     Parameters
@@ -514,7 +515,7 @@ def read_col(column, schema_helper, infile, use_cat=False,
         ph = ThriftObject.from_buffer(infile, "PageHeader")
         if ph.type == parquet_thrift.PageType.DICTIONARY_PAGE:
             dic2 = read_dictionary_page(infile, schema_helper, ph, cmd, utf=se.converted_type == 0)
-            dic2 = convert(dic2, se)
+            dic2 = convert(dic2, se, decimal_mode=decimal_mode)
             if use_cat and dic is not None and (dic2 != dic).any():
                 raise RuntimeError("Attempt to read as categorical a column"
                                    "with multiple dictionary pages.")
@@ -537,7 +538,8 @@ def read_col(column, schema_helper, infile, use_cat=False,
         if ph.type == parquet_thrift.PageType.DATA_PAGE_V2:
             num += read_data_page_v2(infile, schema_helper, se, ph.data_page_header_v2, cmd,
                                      dic, assign, num, use_cat, off, ph, row_idx, selfmade=selfmade,
-                                     row_filter=row_filter, arrow_parts=arrow_parts)
+                                     row_filter=row_filter, arrow_parts=arrow_parts,
+                                     decimal_mode=decimal_mode)
             continue
         if (selfmade and hasattr(cmd, 'statistics') and
                 getattr(cmd.statistics, 'null_count', 1) == 0):
@@ -545,7 +547,8 @@ def read_col(column, schema_helper, infile, use_cat=False,
         else:
             skip_nulls = False
         defi, rep, val = read_data_page(infile, schema_helper, ph, cmd,
-                                        skip_nulls, selfmade=selfmade)
+                                        skip_nulls, selfmade=selfmade,
+                                        decimal_mode=decimal_mode)
         max_defi = schema_helper.max_definition_level(cmd.path_in_schema)
         if isinstance(row_filter, np.ndarray):
             io = index_off + len(val)  # will be new index_off
@@ -626,7 +629,7 @@ def read_col(column, schema_helper, infile, use_cat=False,
             if d and not use_cat:
                 part[defi == max_defi] = dic[val]
             elif not use_cat:
-                part[defi == max_defi] = convert(val, se, dtype=assign.dtype)
+                part[defi == max_defi] = convert(val, se, dtype=assign.dtype, decimal_mode=decimal_mode)
             else:
                 part[defi == max_defi] = val
         else:
@@ -635,7 +638,7 @@ def read_col(column, schema_helper, infile, use_cat=False,
                 piece = piece._data
             if use_cat and not d:
                 # only possible for multi-index
-                val = convert(val, se, dtype=assign.dtype)
+                val = convert(val, se, dtype=assign.dtype, decimal_mode=decimal_mode)
                 try:
                     i = pd.Categorical(val)
                 except:
@@ -645,7 +648,7 @@ def read_col(column, schema_helper, infile, use_cat=False,
             elif d and not use_cat:
                 piece[:] = dic[val]
             elif not use_cat:
-                piece[:] = convert(val, se, dtype=assign.dtype)
+                piece[:] = convert(val, se, dtype=assign.dtype, decimal_mode=decimal_mode)
             else:
                 piece[:] = val
 
@@ -654,7 +657,7 @@ def read_col(column, schema_helper, infile, use_cat=False,
 
 def read_row_group_arrays(file, rg, columns, categories, schema_helper, cats,
                           selfmade=False, assign=None, row_filter=False,
-                          arrow_string_columns=None):
+                          arrow_string_columns=None, decimal_mode='float'):
     """
     Read a row group and return as a dict of arrays
 
@@ -691,7 +694,8 @@ def read_row_group_arrays(file, rg, columns, categories, schema_helper, cats,
                  selfmade=selfmade, assign=out[name],
                  catdef=out.get(name+'-catdef', None),
                  row_filter=row_filter,
-                 arrow_parts=arrow_string_columns.get(name))
+                 arrow_parts=arrow_string_columns.get(name),
+                 decimal_mode=decimal_mode)
 
         if _is_map_like(schema_helper, column):
             # TODO: could be done in fast loop in _assemble_objects?
@@ -711,7 +715,7 @@ def read_row_group_arrays(file, rg, columns, categories, schema_helper, cats,
 def read_row_group(file, rg, columns, categories, schema_helper, cats,
                    selfmade=False, index=None, assign=None,
                    scheme='hive', partition_meta=None, row_filter=False,
-                   arrow_string_columns=None):
+                   arrow_string_columns=None, decimal_mode='float'):
     """
     Access row-group in a file and read some columns into a data-frame.
     """
@@ -720,7 +724,8 @@ def read_row_group(file, rg, columns, categories, schema_helper, cats,
         raise RuntimeError('Going with pre-allocation!')
     read_row_group_arrays(file, rg, columns, categories, schema_helper,
                           cats, selfmade, assign=assign, row_filter=row_filter,
-                          arrow_string_columns=arrow_string_columns)
+                          arrow_string_columns=arrow_string_columns,
+                          decimal_mode=decimal_mode)
 
     for cat in cats:
         if cat not in assign:

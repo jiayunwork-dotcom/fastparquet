@@ -14,6 +14,13 @@ Unreleased
    ``filters`` behaviour is unchanged when ``predicate=None``.
 #. Correct row filtering into masked (nullable) integer/bool arrays when a
    definition-level page is combined with a boolean row filter.
+#. Exact decimal support (opt-in). ``fastparquet.write(...,
+   decimal_columns={col: (precision, scale)})`` writes standard Parquet
+   DECIMAL columns without passing through float;
+   ``ParquetFile(..., decimal_mode='decimal')`` reads DECIMAL values as
+   Python ``Decimal`` objects preserving the declared scale. The defaults
+   (``decimal_columns=None`` and ``decimal_mode='float'``) keep the previous
+   float behaviour. See :ref:`exact-decimals`.
 
 2023.10.0
 ---------

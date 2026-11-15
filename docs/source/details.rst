@@ -164,6 +164,99 @@ You can also enforce the use of a specific library by setting the environment va
 * ``rapidjson``
 * ``json``
 
+.. _exact-decimals:
+
+Exact decimals
+--------------
+
+Parquet has a standard DECIMAL logical type, stored as a signed integer scaled
+by a power of ten. Fastparquet's historical ``object_encoding='decimal'``
+writes such values as IEEE floats, and its default reader returns floats,
+which loses precision. Both remain the default; exact handling is opt-in.
+
+**Writing**
+
+Pass ``decimal_columns`` to :func:`fastparquet.write`, mapping a column name
+to ``(precision, scale)``::
+
+    import decimal
+    from fastparquet import write
+
+    df = pandas.DataFrame({"amount": [decimal.Decimal("12.34"), None]})
+    write("out.parquet", df, decimal_columns={"amount": (12, 2)})
+
+The column is written as a standard Parquet DECIMAL, with both
+``LogicalType.DECIMAL`` and the deprecated ``converted_type`` annotation, so
+other engines can read the exact values without any fastparquet-specific
+metadata.
+
+* ``precision`` must be an integer from 1 to 38 and ``scale`` an integer from
+  0 to ``precision``; booleans are rejected. The column name must occur
+  exactly once in the DataFrame.
+* The physical representation is chosen automatically to cover the declared
+  range: INT32 for precision up to 9, INT64 up to 18, and
+  FIXED_LEN_BYTE_ARRAY above that.
+* ``decimal_columns`` takes precedence over ``object_encoding`` for the
+  selected columns.
+* Accepted values are ``Decimal``, non-boolean integers, and the missing
+  values ``None``/``pd.NA``/float NaN. Floats (including NaN-free ones),
+  strings, booleans, ``Decimal('NaN')`` and ``Decimal('Infinity')`` are
+  rejected. Integer and nullable integer dtypes are both accepted.
+* Every value must be representable exactly at the declared scale and fit the
+  declared precision. Extra trailing zeros (``Decimal('1.2300')`` at scale 2)
+  are fine; a value that would need rounding, truncation or saturation is
+  rejected with a ``ValueError`` naming the column and the zero-based row.
+* All of this is checked before the target file is created or modified: a new
+  file is not left behind and an existing file is byte-for-byte unchanged
+  when the data is rejected.
+* With ``has_nulls=False`` a missing value is rejected up front.
+* ``file_scheme='simple'`` is supported, both for local paths and for seekable
+  binary file objects; multiple row groups, compression, statistics and
+  ``has_nulls`` behave as for other columns. ``file_scheme`` ``hive``/``drill``
+  and a non-empty ``partition_on`` are rejected.
+
+**Appending**
+
+For an existing single-file dataset, pass the same ``decimal_columns``
+declarations with ``append=True``. The column names, precision and scale must
+match the file's DECIMAL schema exactly, and the file's physical type is
+reused. Values are validated before the file is touched; existing bytes are
+unchanged if the append is rejected. Columns not listed keep the previous
+behaviour.
+
+**Reading**
+
+Construct the file with ``decimal_mode='decimal'``::
+
+    from fastparquet import ParquetFile
+    pf = ParquetFile("out.parquet", decimal_mode="decimal")
+    df = pf.to_pandas()
+
+Each non-null DECIMAL cell is a Python ``Decimal`` with the file's declared
+scale, so ``Decimal.as_tuple().exponent == -scale``; missing values are
+``None`` and the column dtype is ``object``. The mode supports the INT32,
+INT64, BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY physical representations, files
+annotated only via the old ``converted_type``, only via ``LogicalType``, or
+both, and all the usual page/compression/encoding variants. It works for
+``to_pandas``, ``iter_row_groups``, column projection, row-group slicing and
+multi-file datasets. Nested or repeated DECIMAL columns are not supported in
+this mode and raise ``ValueError``; other nested columns are unaffected.
+Conflicting or invalid declarations raise ``ValueError`` naming the column
+rather than silently falling back to floats.
+
+Explicit ``dtypes`` that request a non-object type for a DECIMAL column are
+rejected before any data page is read; unselected columns are unaffected.
+``ParquetFile.statistics`` returns ``Decimal`` min/max at the same scale in
+this mode (missing statistics stay ``None``).
+
+``decimal_mode='float'`` is the default and reproduces the historical
+behaviour and values exactly.
+
+Both writing and reading, and the statistics conversion, use integer
+arithmetic on ``Decimal.as_tuple()`` only. They are unaffected by the ambient
+``decimal`` context (precision, rounding mode, Inexact/Rounded traps) and do
+not modify it, the input DataFrame or the file metadata.
+
 Partitions and row-groups
 -------------------------
 
